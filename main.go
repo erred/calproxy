@@ -5,15 +5,16 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 )
 
 func main() {
 	var port, serve, target, user, pass string
-	flag.StringVar(&port, "port", ":80", "port to serve on")
-	flag.StringVar(&serve, "serve", "/calproxy/super-secret-url", "url to serve on")
-	flag.StringVar(&target, "target", "https://www.google.com", "url to redirect to")
-	flag.StringVar(&user, "user", "user1", "user for basic auth")
-	flag.StringVar(&pass, "pass", "hunter2", "password for basic auth")
+	flag.StringVar(&port, "port", os.Getenv("PORT"), "port to serve on")
+	flag.StringVar(&serve, "serve", os.Getenv("SERVE"), "url to serve on")
+	flag.StringVar(&target, "target", os.Getenv("TARGET"), "url to redirect to")
+	flag.StringVar(&user, "user", os.Getenv("AUTH_USER"), "user for basic auth")
+	flag.StringVar(&pass, "pass", os.Getenv("AUTH_PASS"), "password for basic auth")
 	flag.Parse()
 
 	http.HandleFunc(serve, func(w http.ResponseWriter, r *http.Request) {
