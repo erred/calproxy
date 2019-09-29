@@ -20,7 +20,7 @@ func main() {
 	flag.Parse()
 
 	http.Handle(serve, http.StripPrefix(serve, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		u, _ := url.Parse(serve)
+		u, _ := url.Parse(target)
 		u.Path = filepath.Join(u.Path, r.URL.Path)
 		u.RawQuery = r.URL.RawQuery
 		req, err := http.NewRequest(http.MethodGet, u.String(), nil)
