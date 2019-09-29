@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,6 +21,13 @@ func main() {
 	flag.Parse()
 
 	http.Handle(serve, http.StripPrefix(serve, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := httputil.DumpRequest(r, false)
+		if err != nil {
+			log.Println("dump request: ", err)
+		} else {
+			log.Println(string(b))
+		}
+
 		u, _ := url.Parse(target)
 		u.Path = filepath.Join(u.Path, r.URL.Path)
 		u.RawQuery = r.URL.RawQuery
