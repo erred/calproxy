@@ -5,7 +5,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 )
 
 func main() {
@@ -17,8 +19,11 @@ func main() {
 	flag.StringVar(&pass, "pass", os.Getenv("AUTH_PASS"), "password for basic auth")
 	flag.Parse()
 
-	http.HandleFunc(serve, func(w http.ResponseWriter, r *http.Request) {
-		req, err := http.NewRequest(http.MethodGet, target, nil)
+	http.Handle(serve, http.StripPrefix(serve, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u, _ := url.Parse(serve)
+		u.Path = filepath.Join(u.Path, r.URL.Path)
+		u.RawQuery = r.URL.RawQuery
+		req, err := http.NewRequest(http.MethodGet, u.String(), nil)
 		if err != nil {
 			log.Println("build request: ", err)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -35,6 +40,6 @@ func main() {
 		defer res.Body.Close()
 		w.WriteHeader(res.StatusCode)
 		io.Copy(w, res.Body)
-	})
+	})))
 	log.Fatal(http.ListenAndServe(port, nil))
 }
