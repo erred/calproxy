@@ -39,7 +39,7 @@ func init() {
 func main() {
 
 	port := 8080
-	if p, err := strconv.Atoi(os.Getenv("PORT")); err != nil {
+	if p, err := strconv.Atoi(os.Getenv("PORT")); err == nil {
 		port = p
 	}
 	var serve, target, user, pass string

@@ -18,6 +18,9 @@ spec:
       containers:
         - name: calproxy
           image: gcr.io/com-seankhliao/calproxy:latest
+          env:
+            - name: LOGFMT
+              value: json
           envFrom:
             - secretRef:
                 name: calproxy
