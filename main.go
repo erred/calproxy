@@ -37,12 +37,6 @@ func init() {
 }
 
 func main() {
-	u := "https://www.os3.nl/lib/plugins/davcal/calendarserver.php/calendars/sliao/2019-2020_schedule"
-	proxy, err := NewProxy(u, "sliao", "Just4FadedOs3")
-	if err != nil {
-		log.Fatal().Msgf("setup proxy: %v", err)
-	}
-	proxy.getAll(context.Background())
 
 	port := 8080
 	if p, err := strconv.Atoi(os.Getenv("PORT")); err != nil {
@@ -55,6 +49,11 @@ func main() {
 	flag.StringVar(&user, "user", os.Getenv("AUTH_USER"), "user for basic auth")
 	flag.StringVar(&pass, "pass", os.Getenv("AUTH_PASS"), "password for basic auth")
 	flag.Parse()
+
+	proxy, err := NewProxy(target, user, pass)
+	if err != nil {
+		log.Fatal().Msgf("setup proxy: %v", err)
+	}
 
 	http.Handle(serve, proxy)
 	log.Info().Int("port", port).Str("url", serve).Msg("starting server")
