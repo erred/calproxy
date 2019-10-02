@@ -4,17 +4,12 @@ metadata:
   name: calproxy
 spec:
   entryPoints:
-    - web
     - websecure
+  tls:
+    certResolver: default
   routes:
     - kind: Rule
       match: Host(`api.seankhliao.com`) && PathPrefix(`/calproxy`)
-      priority: 10
-      services:
-        - name: calproxy
-          port: 80
-    - kind: Rule
-      match: Host(`cluster16.seankhliao.com`) && PathPrefix(`/calproxy`)
       priority: 10
       services:
         - name: calproxy

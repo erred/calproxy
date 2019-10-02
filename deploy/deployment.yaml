@@ -13,8 +13,13 @@ spec:
       app: calproxy
   template:
     spec:
-      nodeSelector:
-        cloud.google.com/gke-preemptible: "true"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: cloud.google.com/gke-preemptible
+                    operator: Exists
       containers:
         - name: calproxy
           image: gcr.io/com-seankhliao/calproxy:latest
