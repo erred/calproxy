@@ -1,0 +1,11 @@
+# github.com/lestrrat-go/bufferpool v0.0.0-20180220091733-e7784e1b3e37
+github.com/lestrrat-go/bufferpool
+# github.com/lestrrat-go/ical v0.0.0-20190317233631-91af071bafbc
+github.com/lestrrat-go/ical
+# github.com/pkg/errors v0.8.1
+github.com/pkg/errors
+# github.com/rs/zerolog v1.15.0
+github.com/rs/zerolog
+github.com/rs/zerolog/internal/cbor
+github.com/rs/zerolog/internal/json
+github.com/rs/zerolog/log
