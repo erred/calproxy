@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/lestrrat-go/ical"
 	"github.com/rs/zerolog"
@@ -77,13 +78,21 @@ func NewProxy(ur, user, pass string) (*proxy, error) {
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	t := time.Now()
+	remote := r.RemoteAddr
+	if fw := r.Header.Get("x-forwarded-for"); fw != "" {
+		remote = fw
+	}
+
 	cal, err := p.getAll(r.Context())
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		log.Error().Err(err).Msg("proxy.ServeHTTP")
+		log.Error().Dur("elapsed", time.Now().Sub(t)).Str("remote", remote).Str("user-agent", r.Header.Get("user-agent")).Str("proto", r.Proto).Err(err).Msg("proxy.ServeHTTP")
 		return
 	}
+
 	w.Write([]byte(cal))
+	log.Info().Dur("elapsed", time.Now().Sub(t)).Str("remote", remote).Str("user-agent", r.Header.Get("user-agent")).Str("proto", r.Proto).Msg("served")
 }
 
 func (p *proxy) getAll(ctx context.Context) (string, error) {

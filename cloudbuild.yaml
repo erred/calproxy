@@ -26,3 +26,4 @@ substitutions:
   _IMG: calproxy
 tags:
   - $SHORT_SHA
+  - $COMMIT_SHA
