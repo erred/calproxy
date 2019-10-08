@@ -24,3 +24,5 @@ substitutions:
   _ZONE: us-central1-a
   _CLUSTER: cluster16
   _IMG: calproxy
+tags:
+  - $SHORT_SHA
