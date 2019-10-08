@@ -16,27 +16,23 @@ import (
 	"github.com/lestrrat-go/ical"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"golang.org/x/crypto/ssh/terminal"
 )
 
-func init() {
-	// log format, controlled by LOGFMT
-	logfmt := "json"
-	if os.Getenv("LOGFMT") != "json" {
+func initLog() {
+	logfmt := os.Getenv("LOGFMT")
+	if logfmt != "json" {
 		logfmt = "text"
-		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout})
+		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout, NoColor: !terminal.IsTerminal(int(os.Stdout.Fd()))})
 	}
 
-	// log level, controlled by LOGLVL
-	level, err := zerolog.ParseLevel(os.Getenv("LOGLVL"))
-	if err != nil || level == zerolog.NoLevel {
-		level = zerolog.InfoLevel
-	}
-
-	log.Info().Str("LOGLVL", level.String()).Str("LOGFMT", logfmt).Msg("log options")
+	level, _ := zerolog.ParseLevel(os.Getenv("LOGLVL"))
+	log.Info().Str("FMT", logfmt).Str("LVL", level.String()).Msg("log initialized")
 	zerolog.SetGlobalLevel(level)
 }
 
 func main() {
+	initLog()
 
 	port := 8080
 	if p, err := strconv.Atoi(os.Getenv("PORT")); err == nil {
