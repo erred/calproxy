@@ -15,29 +15,16 @@ import (
 	"time"
 
 	"github.com/lestrrat-go/ical"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
-	"golang.org/x/crypto/ssh/terminal"
+	"github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go/ext"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	jaegercfg "github.com/uber/jaeger-client-go/config"
+	"go.uber.org/zap"
 )
 
-func initLog() {
-	logfmt := os.Getenv("LOGFMT")
-	if logfmt != "json" {
-		logfmt = "text"
-		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout, NoColor: !terminal.IsTerminal(int(os.Stdout.Fd()))})
-	}
-
-	level, _ := zerolog.ParseLevel(os.Getenv("LOGLVL"))
-	if level == zerolog.NoLevel {
-		level = zerolog.InfoLevel
-	}
-	log.Info().Str("FMT", logfmt).Str("LVL", level.String()).Msg("log initialized")
-	zerolog.SetGlobalLevel(level)
-}
-
 func main() {
-	initLog()
-
 	port := 8080
 	if p, err := strconv.Atoi(os.Getenv("PORT")); err == nil {
 		port = p
@@ -48,28 +35,81 @@ func main() {
 	flag.StringVar(&target, "target", os.Getenv("TARGET"), "url to redirect to")
 	flag.StringVar(&user, "user", os.Getenv("AUTH_USER"), "user for basic auth")
 	flag.StringVar(&pass, "pass", os.Getenv("AUTH_PASS"), "password for basic auth")
+	// flag.StringVar(&logfmt, "logfmt", "json", "log format")
 	flag.Parse()
 
-	proxy, err := NewProxy(target, user, pass)
+	// logger
+	prod, err := zap.NewProduction()
 	if err != nil {
-		log.Fatal().Msgf("setup proxy: %v", err)
+		fmt.Fprintf(os.Stdout, "init zap: %v", err)
+		os.Exit(1)
+	}
+	log := prod.Sugar()
+
+	// tracer
+	cfg, err := jaegercfg.FromEnv()
+	if err != nil {
+		log.Fatalw("init tracer env", "err", err)
+	}
+	cfg.ServiceName = "calproxy"
+	tracer, closer, err := cfg.NewTracer()
+	if err != nil {
+		log.Fatalw("init tracer", "err", err)
+	}
+	defer closer.Close()
+	opentracing.SetGlobalTracer(tracer)
+
+	// metrics
+
+	// http handler
+	proxy, err := NewProxy(log, target, user, pass)
+	if err != nil {
+		log.Fatalw("init proxy", "err", err)
 	}
 
+	http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
 	http.Handle(serve, proxy)
-	log.Info().Int("port", port).Str("url", serve).Msg("starting server")
+	http.Handle("/metrics", promhttp.Handler())
+	log.Infow("starting server", "port", port, "url", serve)
 	http.ListenAndServe(fmt.Sprintf(":%d", port), nil)
 }
 
 type proxy struct {
+	log    *zap.SugaredLogger
+	inreq  prometheus.Counter
+	inok   prometheus.Counter
+	inerr  prometheus.Counter
+	outreq prometheus.Counter
+
 	url *url.URL
-	wg  sync.WaitGroup
 
 	user, pass string
 }
 
-func NewProxy(ur, user, pass string) (*proxy, error) {
+func NewProxy(log *zap.SugaredLogger, ur, user, pass string) (*proxy, error) {
 	var err error
 	p := proxy{
+		log: log,
+
+		inreq: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "calproxy_reqs_total",
+			Help: "The number of incoming requests",
+		}),
+		inok: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "calproxy_reqs_ok_total",
+			Help: "The number of incoming successful requests",
+		}),
+		inerr: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "calproxy_reqs_err_total",
+			Help: "The number of incoming errored requests",
+		}),
+		outreq: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "calproxy_outgoing_reqs_total",
+			Help: "The number of outgoing requests",
+		}),
+
 		user: user,
 		pass: pass,
 	}
@@ -78,21 +118,33 @@ func NewProxy(ur, user, pass string) (*proxy, error) {
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	wctx, err := opentracing.GlobalTracer().Extract(opentracing.HTTPHeaders, opentracing.HTTPHeadersCarrier(r.Header))
+	if err != nil {
+		p.log.Debugw("proxy.ServeHTTP extract trace header", "err", err)
+	}
+	span := opentracing.StartSpan("ServeHTTP", ext.RPCServerOption(wctx))
+	defer span.Finish()
+	ctx := opentracing.ContextWithSpan(r.Context(), span)
+
+	p.inreq.Inc()
+
 	t := time.Now()
 	remote := r.RemoteAddr
 	if fw := r.Header.Get("x-forwarded-for"); fw != "" {
 		remote = fw
 	}
 
-	cal, err := p.getAll(r.Context())
+	cal, err := p.getAll(ctx)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		log.Error().Dur("elapsed", time.Now().Sub(t)).Str("remote", remote).Str("user-agent", r.Header.Get("user-agent")).Str("proto", r.Proto).Err(err).Msg("proxy.ServeHTTP")
+		p.log.Errorw("proxy.ServeHTTP getAll", "err", err, "remote", remote, "user-agent", r.Header.Get("user-agent"), "elapsed", time.Since(t))
+		p.inerr.Inc()
 		return
 	}
 
 	w.Write([]byte(cal))
-	log.Info().Dur("elapsed", time.Now().Sub(t)).Str("remote", remote).Str("user-agent", r.Header.Get("user-agent")).Str("proto", r.Proto).Msg("served")
+	p.log.Infow("proxy.ServeHTTP served", "remote", remote, "user-agent", r.Header.Get("user-agent"), "elapsed", time.Since(t))
+	p.inok.Inc()
 }
 
 func (p *proxy) getAll(ctx context.Context) (string, error) {
@@ -108,7 +160,9 @@ func (p *proxy) getAll(ctx context.Context) (string, error) {
 }
 
 func (p *proxy) getIndex(ctx context.Context) ([]string, error) {
-	// fmt.Println(string(body))
+	span, ctx := opentracing.StartSpanFromContext(ctx, "getIndex")
+	defer span.Finish()
+
 	b, err := p.get(ctx, p.url.String())
 	if err != nil {
 		return nil, fmt.Errorf("proxy.getIndex: %w", err)
@@ -140,6 +194,9 @@ func (p *proxy) getIndex(ctx context.Context) ([]string, error) {
 }
 
 func (p *proxy) getIcs(ctx context.Context, urls []string) (*ical.Calendar, error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "getIcs")
+	defer span.Finish()
+
 	var wg sync.WaitGroup
 	icsec, icstc := make(chan *ical.Event, len(urls)), make(chan *ical.Timezone, 10)
 	done, calc := make(chan struct{}), make(chan *ical.Calendar)
@@ -173,13 +230,13 @@ func (p *proxy) getIcs(ctx context.Context, urls []string) (*ical.Calendar, erro
 			}
 			b, err := p.get(ctx, URL.String())
 			if err != nil {
-				log.Error().Err(err).Msg("proxy.getIcs get")
+				p.log.Errorw("proxy.getIcs get", "err", err)
 				return
 			}
 
 			cal, err := ical.NewParser().Parse(bytes.NewBuffer(b))
 			if err != nil {
-				log.Error().Err(err).Msg("prox.getIcs parse")
+				p.log.Errorw("proxy.getIcs parse", "err", err)
 			}
 
 			for e := range cal.Entries() {
@@ -188,7 +245,7 @@ func (p *proxy) getIcs(ctx context.Context, urls []string) (*ical.Calendar, erro
 				} else if tz, ok := e.(*ical.Timezone); ok {
 					icstc <- tz
 				} else {
-					log.Error().Str("entrytype", e.Type()).Msg("proxy.getIcs unhandled")
+					p.log.Errorw("proxy.getIcs unhandled", "entrytype", e.Type())
 				}
 
 			}
@@ -202,6 +259,8 @@ func (p *proxy) getIcs(ctx context.Context, urls []string) (*ical.Calendar, erro
 }
 
 func (p *proxy) get(ctx context.Context, u string) ([]byte, error) {
+	p.outreq.Inc()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("proxy.get build request: %w", err)
@@ -213,7 +272,6 @@ func (p *proxy) get(ctx context.Context, u string) ([]byte, error) {
 		return nil, fmt.Errorf("proxy.get do request: %w", err)
 	}
 	defer res.Body.Close()
-	log.Debug().Int("code", res.StatusCode).Str("status", res.Status).Str("GET", u).Msg("proxy.get")
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		return nil, fmt.Errorf("proxy.get resonse: %d %s", res.StatusCode, res.Status)
 	}

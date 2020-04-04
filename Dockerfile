@@ -1,10 +1,10 @@
 FROM golang:alpine AS build
 
 WORKDIR /app
-ENV GO111MODULE=on CGO_ENABLED=0
+ENV CGO_ENABLED=0
 RUN apk add --no-cache ca-certificates
 COPY . .
-RUN go build -mod=vendor -o app
+RUN go build -o app
 
 FROM scratch
 
