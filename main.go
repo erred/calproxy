@@ -7,168 +7,150 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/lestrrat-go/ical"
-	"github.com/opentracing/opentracing-go"
-	"github.com/opentracing/opentracing-go/ext"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	jaegercfg "github.com/uber/jaeger-client-go/config"
-	"go.uber.org/zap"
+	"github.com/rs/zerolog"
 )
 
 func main() {
-	port := 8080
-	if p, err := strconv.Atoi(os.Getenv("PORT")); err == nil {
-		port = p
-	}
-	var serve, target, user, pass string
-	flag.IntVar(&port, "port", port, "port to serve on")
-	flag.StringVar(&serve, "serve", os.Getenv("SERVE"), "url to serve on")
-	flag.StringVar(&target, "target", os.Getenv("TARGET"), "url to redirect to")
-	flag.StringVar(&user, "user", os.Getenv("AUTH_USER"), "user for basic auth")
-	flag.StringVar(&pass, "pass", os.Getenv("AUTH_PASS"), "password for basic auth")
-	// flag.StringVar(&logfmt, "logfmt", "json", "log format")
-	flag.Parse()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGINT)
+		<-sigs
+		cancel()
+	}()
 
-	// logger
-	prod, err := zap.NewProduction()
-	if err != nil {
-		fmt.Fprintf(os.Stdout, "init zap: %v", err)
-		os.Exit(1)
-	}
-	log := prod.Sugar()
+	// server
+	s := NewServer(os.Args)
+	s.Run(ctx)
+}
 
-	// tracer
-	cfg, err := jaegercfg.FromEnv()
-	if err != nil {
-		log.Fatalw("init tracer env", "err", err)
-	}
-	cfg.ServiceName = "calproxy"
-	tracer, closer, err := cfg.NewTracer()
-	if err != nil {
-		log.Fatalw("init tracer", "err", err)
-	}
-	defer closer.Close()
-	opentracing.SetGlobalTracer(tracer)
+type Server struct {
+	// config
+	url        *url.URL
+	user, pass string
 
 	// metrics
+	inreqs  *prometheus.CounterVec
+	outreqs prometheus.Counter
 
-	// http handler
-	proxy, err := NewProxy(log, target, user, pass)
-	if err != nil {
-		log.Fatalw("init proxy", "err", err)
+	// server
+	log zerolog.Logger
+	mux *http.ServeMux
+	srv *http.Server
+}
+
+func NewServer(args []string) *Server {
+	s := &Server{
+		inreqs: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "calproxy_in_requests",
+			Help: "incoming requests",
+		},
+			[]string{"status"},
+		),
+		outreqs: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "calproxy_outgoing_reqs",
+			Help: "outgoing requests",
+		}),
+		log: zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, NoColor: true, TimeFormat: time.RFC3339}).With().Timestamp().Logger(),
+		mux: http.NewServeMux(),
+		srv: &http.Server{
+			ReadHeaderTimeout: 5 * time.Second,
+			WriteTimeout:      5 * time.Second,
+			IdleTimeout:       60 * time.Second,
+		},
 	}
 
-	http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	http.Handle(serve, proxy)
-	http.Handle("/metrics", promhttp.Handler())
-	log.Infow("starting server", "port", port, "url", serve)
-	http.ListenAndServe(fmt.Sprintf(":%d", port), nil)
-}
+	s.mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	s.mux.Handle("/metrics", promhttp.Handler())
+	s.mux.Handle("/", s)
 
-type proxy struct {
-	log    *zap.SugaredLogger
-	inreq  prometheus.Counter
-	inok   prometheus.Counter
-	inerr  prometheus.Counter
-	outreq prometheus.Counter
+	s.srv.Handler = s.mux
+	s.srv.ErrorLog = log.New(s.log, "", 0)
 
-	url *url.URL
+	var ur string
+	fs := flag.NewFlagSet(args[0], flag.ExitOnError)
+	fs.StringVar(&s.srv.Addr, "addr", ":80", "host:port to serve on")
+	fs.StringVar(&ur, "target", os.Getenv("TARGET"), "url to redirect to")
+	fs.StringVar(&s.user, "user", os.Getenv("AUTH_USER"), "user for basic auth")
+	fs.StringVar(&s.pass, "pass", os.Getenv("AUTH_PASS"), "password for basic auth")
+	fs.Parse(args[1:])
 
-	user, pass string
-}
-
-func NewProxy(log *zap.SugaredLogger, ur, user, pass string) (*proxy, error) {
 	var err error
-	p := proxy{
-		log: log,
-
-		inreq: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "calproxy_reqs_total",
-			Help: "The number of incoming requests",
-		}),
-		inok: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "calproxy_reqs_ok_total",
-			Help: "The number of incoming successful requests",
-		}),
-		inerr: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "calproxy_reqs_err_total",
-			Help: "The number of incoming errored requests",
-		}),
-		outreq: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "calproxy_outgoing_reqs_total",
-			Help: "The number of outgoing requests",
-		}),
-
-		user: user,
-		pass: pass,
+	s.url, err = url.Parse(ur)
+	if err != nil {
+		s.log.Fatal().Err(err).Msg("parse target url")
 	}
-	p.url, err = url.Parse(ur)
-	return &p, err
+	return s
 }
 
-func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	wctx, err := opentracing.GlobalTracer().Extract(opentracing.HTTPHeaders, opentracing.HTTPHeadersCarrier(r.Header))
-	if err != nil {
-		p.log.Debugw("proxy.ServeHTTP extract trace header", "err", err)
+func (s *Server) Run(ctx context.Context) {
+	errc := make(chan error)
+	go func() {
+		errc <- s.srv.ListenAndServe()
+	}()
+
+	var err error
+	select {
+	case err = <-errc:
+	case <-ctx.Done():
+		err = s.srv.Shutdown(ctx)
 	}
-	span := opentracing.StartSpan("ServeHTTP", ext.RPCServerOption(wctx))
-	defer span.Finish()
-	ctx := opentracing.ContextWithSpan(r.Context(), span)
+	s.log.Error().Err(err).Msg("server exit")
+}
 
-	p.inreq.Inc()
-
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	t := time.Now()
-	remote := r.RemoteAddr
-	if fw := r.Header.Get("x-forwarded-for"); fw != "" {
-		remote = fw
+	remote := r.Header.Get("x-forwarded-for")
+	if remote == "" {
+		remote = r.RemoteAddr
 	}
 
-	cal, err := p.getAll(ctx)
+	ctx := context.Background()
+	cal, err := s.getAll(ctx)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		p.log.Errorw("proxy.ServeHTTP getAll", "err", err, "remote", remote, "user-agent", r.Header.Get("user-agent"), "elapsed", time.Since(t))
-		p.inerr.Inc()
+		s.log.Error().Str("user-agent", r.Header.Get("user-agent")).Str("remote", remote).Dur("dur", time.Since(t)).Err(err).Msg("getall")
+		s.inreqs.WithLabelValues("err").Inc()
 		return
 	}
 
 	w.Write([]byte(cal))
-	p.log.Infow("proxy.ServeHTTP served", "remote", remote, "user-agent", r.Header.Get("user-agent"), "elapsed", time.Since(t))
-	p.inok.Inc()
+	s.log.Info().Str("user-agent", r.Header.Get("user-agent")).Str("remote", remote).Dur("dur", time.Since(t)).Err(err).Msg("getall")
+	s.inreqs.WithLabelValues("ok").Inc()
 }
 
-func (p *proxy) getAll(ctx context.Context) (string, error) {
-	urls, err := p.getIndex(ctx)
+func (s *Server) getAll(ctx context.Context) (string, error) {
+	urls, err := s.getIndex(ctx)
 	if err != nil {
 		return "", fmt.Errorf("proxy.getAll: %w", err)
 	}
-	cal, err := p.getIcs(ctx, urls)
+	cal, err := s.getIcs(ctx, urls)
 	if err != nil {
 		return "", fmt.Errorf("proxy.getAll: %w", err)
 	}
 	return cal.String(), nil
 }
 
-func (p *proxy) getIndex(ctx context.Context) ([]string, error) {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "getIndex")
-	defer span.Finish()
-
-	b, err := p.get(ctx, p.url.String())
+func (s *Server) getIndex(ctx context.Context) ([]string, error) {
+	b, err := s.get(ctx, s.url.String())
 	if err != nil {
 		return nil, fmt.Errorf("proxy.getIndex: %w", err)
 	}
 
-	var x Html
+	var x HTML
 	err = xml.Unmarshal(b, &x)
 	if err != nil {
 		return nil, fmt.Errorf("proxy.getIndex unmarshal: %w", err)
@@ -193,10 +175,7 @@ func (p *proxy) getIndex(ctx context.Context) ([]string, error) {
 	return urls, nil
 }
 
-func (p *proxy) getIcs(ctx context.Context, urls []string) (*ical.Calendar, error) {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "getIcs")
-	defer span.Finish()
-
+func (s *Server) getIcs(ctx context.Context, urls []string) (*ical.Calendar, error) {
 	var wg sync.WaitGroup
 	icsec, icstc := make(chan *ical.Event, len(urls)), make(chan *ical.Timezone, 10)
 	done, calc := make(chan struct{}), make(chan *ical.Calendar)
@@ -224,19 +203,19 @@ func (p *proxy) getIcs(ctx context.Context, urls []string) (*ical.Calendar, erro
 		go func(u string) {
 			defer wg.Done()
 			URL := url.URL{
-				Scheme: p.url.Scheme,
-				Host:   p.url.Host,
+				Scheme: s.url.Scheme,
+				Host:   s.url.Host,
 				Path:   u,
 			}
-			b, err := p.get(ctx, URL.String())
+			b, err := s.get(ctx, URL.String())
 			if err != nil {
-				p.log.Errorw("proxy.getIcs get", "err", err)
+				s.log.Error().Err(err).Msg("proxy.getIcs get")
 				return
 			}
 
 			cal, err := ical.NewParser().Parse(bytes.NewBuffer(b))
 			if err != nil {
-				p.log.Errorw("proxy.getIcs parse", "err", err)
+				s.log.Error().Err(err).Msg("proxy.getIcs parse")
 			}
 
 			for e := range cal.Entries() {
@@ -245,7 +224,7 @@ func (p *proxy) getIcs(ctx context.Context, urls []string) (*ical.Calendar, erro
 				} else if tz, ok := e.(*ical.Timezone); ok {
 					icstc <- tz
 				} else {
-					p.log.Errorw("proxy.getIcs unhandled", "entrytype", e.Type())
+					s.log.Error().Str("type", e.Type()).Msg("proxy.getIcs unhandled entry")
 				}
 
 			}
@@ -258,14 +237,13 @@ func (p *proxy) getIcs(ctx context.Context, urls []string) (*ical.Calendar, erro
 	return <-calc, nil
 }
 
-func (p *proxy) get(ctx context.Context, u string) ([]byte, error) {
-	p.outreq.Inc()
-
+func (s *Server) get(ctx context.Context, u string) ([]byte, error) {
+	s.outreqs.Inc()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("proxy.get build request: %w", err)
 	}
-	req.SetBasicAuth(p.user, p.pass)
+	req.SetBasicAuth(s.user, s.pass)
 
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -282,7 +260,7 @@ func (p *proxy) get(ctx context.Context, u string) ([]byte, error) {
 	return body, nil
 }
 
-type Html struct {
+type HTML struct {
 	XMLName xml.Name `xml:"html"`
 	Body    struct {
 		Section []struct {
