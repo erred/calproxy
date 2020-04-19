@@ -23,6 +23,18 @@ import (
 	"github.com/rs/zerolog"
 )
 
+var (
+	port = func() string {
+		port := os.Getenv("PORT")
+		if port == "" {
+			port = ":8080"
+		} else if port[0] != ':' {
+			port = ":" + port
+		}
+		return port
+	}()
+)
+
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -81,7 +93,7 @@ func NewServer(args []string) *Server {
 
 	var ur string
 	fs := flag.NewFlagSet(args[0], flag.ExitOnError)
-	fs.StringVar(&s.srv.Addr, "addr", ":80", "host:port to serve on")
+	fs.StringVar(&s.srv.Addr, "addr", port, "host:port to serve on")
 	fs.StringVar(&ur, "target", os.Getenv("TARGET"), "url to redirect to")
 	fs.StringVar(&s.user, "user", os.Getenv("AUTH_USER"), "user for basic auth")
 	fs.StringVar(&s.pass, "pass", os.Getenv("AUTH_PASS"), "password for basic auth")
