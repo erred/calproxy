@@ -104,6 +104,8 @@ func NewServer(args []string) *Server {
 	if err != nil {
 		s.log.Fatal().Err(err).Msg("parse target url")
 	}
+
+	s.log.Info().Str("target", s.url.String()).Str("addr", s.srv.Addr).Msg("configured")
 	return s
 }
 
