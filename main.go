@@ -53,6 +53,9 @@ type Server struct {
 	url        *url.URL
 	user, pass string
 
+	rel sync.RWMutex
+	res string
+
 	// metrics
 	inreqs  *prometheus.CounterVec
 	outreqs prometheus.Counter
@@ -110,12 +113,24 @@ func NewServer(args []string) *Server {
 }
 
 func (s *Server) Run(ctx context.Context) {
+	err := s.getAll(ctx)
+	if err != nil {
+		s.log.Error().Err(err).Msg("init get all")
+	}
+	go func() {
+		for range time.NewTicker(2 * time.Hour).C {
+			err := s.getAll(ctx)
+			if err != nil {
+				s.log.Error().Err(err).Msg("init get all")
+			}
+		}
+	}()
+
 	errc := make(chan error)
 	go func() {
 		errc <- s.srv.ListenAndServe()
 	}()
 
-	var err error
 	select {
 	case err = <-errc:
 	case <-ctx.Done():
@@ -125,36 +140,38 @@ func (s *Server) Run(ctx context.Context) {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	t := time.Now()
 	remote := r.Header.Get("x-forwarded-for")
 	if remote == "" {
 		remote = r.RemoteAddr
 	}
 
-	ctx := context.Background()
-	cal, err := s.getAll(ctx)
-	if err != nil {
+	s.rel.RLock()
+	defer s.rel.RUnlock()
+	if s.res == "" {
 		w.WriteHeader(http.StatusInternalServerError)
-		s.log.Error().Str("user-agent", r.Header.Get("user-agent")).Str("remote", remote).Dur("dur", time.Since(t)).Err(err).Msg("getall")
+		s.log.Error().Str("user-agent", r.Header.Get("user-agent")).Str("remote", remote).Msg("no content")
 		s.inreqs.WithLabelValues("err").Inc()
 		return
 	}
+	w.Write([]byte(s.res))
 
-	w.Write([]byte(cal))
-	s.log.Info().Str("user-agent", r.Header.Get("user-agent")).Str("remote", remote).Dur("dur", time.Since(t)).Err(err).Msg("getall")
+	s.log.Info().Str("user-agent", r.Header.Get("user-agent")).Str("remote", remote).Msg("served")
 	s.inreqs.WithLabelValues("ok").Inc()
 }
 
-func (s *Server) getAll(ctx context.Context) (string, error) {
+func (s *Server) getAll(ctx context.Context) error {
 	urls, err := s.getIndex(ctx)
 	if err != nil {
-		return "", fmt.Errorf("proxy.getAll: %w", err)
+		return fmt.Errorf("proxy.getAll: %w", err)
 	}
 	cal, err := s.getIcs(ctx, urls)
 	if err != nil {
-		return "", fmt.Errorf("proxy.getAll: %w", err)
+		return fmt.Errorf("proxy.getAll: %w", err)
 	}
-	return cal.String(), nil
+	s.rel.Lock()
+	s.res = cal.String()
+	s.rel.Unlock()
+	return nil
 }
 
 func (s *Server) getIndex(ctx context.Context) ([]string, error) {
@@ -211,10 +228,20 @@ func (s *Server) getIcs(ctx context.Context, urls []string) (*ical.Calendar, err
 		calc <- cal
 	}()
 
+	sem := make(chan struct{}, 5)
+	for i := 0; i < 5; i++ {
+		sem <- struct{}{}
+	}
+
+	wg.Add(len(urls))
 	for _, u := range urls {
-		wg.Add(1)
+		<-sem
 		go func(u string) {
-			defer wg.Done()
+			defer func() {
+				wg.Done()
+				sem <- struct{}{}
+			}()
+
 			URL := url.URL{
 				Scheme: s.url.Scheme,
 				Host:   s.url.Host,
