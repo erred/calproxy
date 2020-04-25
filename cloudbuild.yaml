@@ -45,4 +45,4 @@ steps:
       - --max-instances=1
       - --cpu=1
       - --memory=128Mi
-      - --timeout=60s
+      - --timeout=10s
