@@ -7,45 +7,23 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
-	"os/signal"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/lestrrat-go/ical"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/rs/zerolog"
-)
-
-var (
-	port = func() string {
-		port := os.Getenv("PORT")
-		if port == "" {
-			port = ":8080"
-		} else if port[0] != ':' {
-			port = ":" + port
-		}
-		return port
-	}()
+	"go.seankhliao.com/usvc"
 )
 
 func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		sigs := make(chan os.Signal, 1)
-		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-		<-sigs
-		cancel()
-	}()
-
 	// server
-	NewServer(os.Args).Run(ctx)
+	s := NewServer(os.Args)
+	s.svc.Log.Error().Err(usvc.Run(usvc.SignalContext(), s)).Msg("exited")
 }
 
 type Server struct {
@@ -61,12 +39,11 @@ type Server struct {
 	outreqs prometheus.Counter
 
 	// server
-	log zerolog.Logger
-	mux *http.ServeMux
-	srv *http.Server
+	svc *usvc.ServerSimple
 }
 
 func NewServer(args []string) *Server {
+	fs := flag.NewFlagSet(args[0], flag.ExitOnError)
 	s := &Server{
 		inreqs: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "calproxy_in_requests",
@@ -78,25 +55,13 @@ func NewServer(args []string) *Server {
 			Name: "calproxy_outgoing_reqs",
 			Help: "outgoing requests",
 		}),
-		log: zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, NoColor: true, TimeFormat: time.RFC3339}).With().Timestamp().Logger(),
-		mux: http.NewServeMux(),
-		srv: &http.Server{
-			ReadHeaderTimeout: 5 * time.Second,
-			WriteTimeout:      5 * time.Second,
-			IdleTimeout:       60 * time.Second,
-		},
+		svc: usvc.NewServerSimple(usvc.NewConfig(fs)),
 	}
 
-	s.mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
-	s.mux.Handle("/metrics", promhttp.Handler())
-	s.mux.Handle("/", s)
-
-	s.srv.Handler = s.mux
-	s.srv.ErrorLog = log.New(s.log, "", 0)
+	s.svc.Mux.Handle("/metrics", promhttp.Handler())
+	s.svc.Mux.Handle("/", s)
 
 	var ur string
-	fs := flag.NewFlagSet(args[0], flag.ExitOnError)
-	fs.StringVar(&s.srv.Addr, "addr", port, "host:port to serve on")
 	fs.StringVar(&ur, "target", os.Getenv("TARGET"), "url to redirect to")
 	fs.StringVar(&s.user, "user", os.Getenv("AUTH_USER"), "user for basic auth")
 	fs.StringVar(&s.pass, "pass", os.Getenv("AUTH_PASS"), "password for basic auth")
@@ -105,38 +70,32 @@ func NewServer(args []string) *Server {
 	var err error
 	s.url, err = url.Parse(ur)
 	if err != nil {
-		s.log.Fatal().Err(err).Msg("parse target url")
+		s.svc.Log.Fatal().Err(err).Msg("parse target url")
 	}
 
-	s.log.Info().Str("target", s.url.String()).Str("addr", s.srv.Addr).Msg("configured")
+	s.svc.Log.Info().Str("target", s.url.String()).Msg("configured")
 	return s
 }
 
-func (s *Server) Run(ctx context.Context) {
+func (s *Server) Run() error {
+	ctx := context.Background()
 	err := s.getAll(ctx)
 	if err != nil {
-		s.log.Error().Err(err).Msg("init get all")
+		s.svc.Log.Error().Err(err).Msg("init get all")
 	}
 	go func() {
 		for range time.NewTicker(2 * time.Hour).C {
 			err := s.getAll(ctx)
 			if err != nil {
-				s.log.Error().Err(err).Msg("init get all")
+				s.svc.Log.Error().Err(err).Msg("init get all")
 			}
 		}
 	}()
+	return s.svc.Run()
+}
 
-	errc := make(chan error)
-	go func() {
-		errc <- s.srv.ListenAndServe()
-	}()
-
-	select {
-	case err = <-errc:
-	case <-ctx.Done():
-		err = s.srv.Shutdown(ctx)
-	}
-	s.log.Error().Err(err).Msg("server exit")
+func (s *Server) Shutdown() error {
+	return s.svc.Shutdown()
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -149,13 +108,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer s.rel.RUnlock()
 	if s.res == "" {
 		w.WriteHeader(http.StatusInternalServerError)
-		s.log.Error().Str("user-agent", r.Header.Get("user-agent")).Str("remote", remote).Msg("no content")
+		s.svc.Log.Error().Str("user-agent", r.Header.Get("user-agent")).Str("remote", remote).Msg("no content")
 		s.inreqs.WithLabelValues("err").Inc()
 		return
 	}
 	w.Write([]byte(s.res))
 
-	s.log.Info().Str("user-agent", r.Header.Get("user-agent")).Str("remote", remote).Msg("served")
+	s.svc.Log.Info().Str("user-agent", r.Header.Get("user-agent")).Str("remote", remote).Msg("served")
 	s.inreqs.WithLabelValues("ok").Inc()
 }
 
@@ -249,13 +208,13 @@ func (s *Server) getIcs(ctx context.Context, urls []string) (*ical.Calendar, err
 			}
 			b, err := s.get(ctx, URL.String())
 			if err != nil {
-				s.log.Error().Err(err).Msg("proxy.getIcs get")
+				s.svc.Log.Error().Err(err).Msg("proxy.getIcs get")
 				return
 			}
 
 			cal, err := ical.NewParser().Parse(bytes.NewBuffer(b))
 			if err != nil {
-				s.log.Error().Err(err).Msg("proxy.getIcs parse")
+				s.svc.Log.Error().Err(err).Msg("proxy.getIcs parse")
 			}
 
 			for e := range cal.Entries() {
@@ -264,7 +223,7 @@ func (s *Server) getIcs(ctx context.Context, urls []string) (*ical.Calendar, err
 				} else if tz, ok := e.(*ical.Timezone); ok {
 					icstc <- tz
 				} else {
-					s.log.Error().Str("type", e.Type()).Msg("proxy.getIcs unhandled entry")
+					s.svc.Log.Error().Str("type", e.Type()).Msg("proxy.getIcs unhandled entry")
 				}
 
 			}
