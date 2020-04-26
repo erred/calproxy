@@ -78,12 +78,12 @@ func NewServer(args []string) *Server {
 }
 
 func (s *Server) Run() error {
-	ctx := context.Background()
-	err := s.getAll(ctx)
-	if err != nil {
-		s.svc.Log.Error().Err(err).Msg("init get all")
-	}
 	go func() {
+		ctx := context.Background()
+		err := s.getAll(ctx)
+		if err != nil {
+			s.svc.Log.Error().Err(err).Msg("init get all")
+		}
 		for range time.NewTicker(2 * time.Hour).C {
 			err := s.getAll(ctx)
 			if err != nil {
